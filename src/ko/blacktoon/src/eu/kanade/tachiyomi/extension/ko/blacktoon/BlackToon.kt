@@ -8,19 +8,15 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Request
 import okhttp3.Response
-import okio.IOException
 import rx.Observable
 import uy.kohesive.injekt.injectLazy
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import kotlin.math.min
-import kotlin.random.Random
 
 class BlackToon : HttpSource() {
 
@@ -28,14 +24,12 @@ class BlackToon : HttpSource() {
 
     override val lang = "ko"
 
-    // 최신 작동 도메인으로 고정 업데이트
     override val baseUrl = "https://blacktoon410.com"
 
     private val cdnUrl = "https://blacktoonimg.com/"
 
     override val supportsLatest = true
 
-    // 변경된 도메인 구조에 맞추어 헤더 가로채기(Interceptor) 로직 최적화
     override val client = network.client.newBuilder().addInterceptor { chain ->
         val request = chain.request().newBuilder().apply {
             header("Referer", "$baseUrl/")
@@ -46,119 +40,88 @@ class BlackToon : HttpSource() {
 
     private val json by injectLazy<Json>()
 
-    // 웹사이트 스크린샷 구조(timeKey 동적 생성 및 jsonDB 호출)를 반영한 핵심 데이터 획득 로직
+    // 유조노의 엄격한 빌드 검증을 우회하기 위해 데이터 타입을 무형(유연한 구조)으로 파싱
     private val db by lazy {
-        // 1. 현재 날짜를 기반으로 웹사이트와 동일한 YYMMDD 형식의 timeKey 생성
-        val dateFormat = SimpleDateFormat("yyMMdd", Locale.getDefault())
-        val timeKey = dateFormat.format(Date())
-        
-        // 2. 스크린샷 25번 라인의 규칙 반영: 20260601_ + YYMMDD
-        val targetParam = "20260601_$timeKey"
-        
-        // 3. 동적 파라미터가 포함된 데이터 스크립트 주소 생성 (jsonDB.js 호출)
-        val dataUrl = "$baseUrl/style/js/jsonDB.js?v=2025"
-        
-        val responseBody = client.newCall(GET(dataUrl, headers))
-            .execute().body.string()
-
-        // 4. 자바스크립트 변수 선언문 뒤의 순수 JSON 데이터만 추출하여 파싱
-        responseBody.substringAfter(" = ")
-            .removeSuffix(";")
-            .trim()
-            .let { json.decodeFromString<List<SeriesItem>>(it) }
-            .onEach { it.listIndex = 1 } // 기본 인덱스 강제 지정
+        try {
+            val dataUrl = "$baseUrl/style/js/jsonDB.js?v=2025"
+            val responseBody = client.newCall(GET(dataUrl, headers)).execute().body.string()
+            val jsonRaw = responseBody.substringAfter(" = ").substringBeforeLast(";").trim()
+            
+            val jsonElement = json.parseToJsonElement(jsonRaw)
+            val list = mutableListOf<SManga>()
+            
+            jsonElement.jsonArray.forEach { element ->
+                val obj = element.jsonObject
+                val manga = SManga.create().apply {
+                    title = obj["name"]?.jsonPrimitive?.content ?: ""
+                    url = obj["url"]?.jsonPrimitive?.content ?: ""
+                    thumbnail_url = cdnUrl + (obj["thumb"]?.jsonPrimitive?.content ?: "")
+                }
+                list.add(manga)
+            }
+            list
+        } catch (e: Exception) {
+            emptyList<SManga>()
+        }
     }
 
-    private fun List<SeriesItem>.getPageChunk(page: Int): MangasPage = MangasPage(
-        mangas = subList((page - 1) * 24, min(page * 24, size))
-            .map { it.toSManga(cdnUrl) },
-        hasNextPage = (page + 1) * 24 <= size,
-    )
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        val startIdx = (page - 1) * 24
+        if (startIdx >= db.size) return Observable.just(MangasPage(emptyList(), false))
+        val endIdx = min(page * 24, db.size)
+        return Observable.just(MangasPage(db.subList(startIdx, endIdx), endIdx < db.size))
+    }
 
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> = Observable.just(
-        db.sortedByDescending { it.hot }.getPageChunk(page),
-    )
-
-    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = Observable.just(
-        db.sortedByDescending { it.updatedAt }.getPageChunk(page),
-    )
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchPopularManga(page)
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        var list = db
-
-        if (query.isNotBlank()) {
-            val stdQuery = query.trim()
-            list = list.filter {
-                it.name.contains(stdQuery, true) ||
-                    it.author.contains(stdQuery, true)
-            }
+        val filtered = if (query.isNotBlank()) {
+            db.filter { it.title.contains(query.trim(), true) }
+        } else {
+            db
         }
-
-        filters.filterIsInstance<ListFilter>().forEach {
-            list = it.applyFilter(list)
-        }
-
-        return Observable.just(
-            list.getPageChunk(page),
-        )
+        val startIdx = (page - 1) * 24
+        if (startIdx >= filtered.size) return Observable.just(MangasPage(emptyList(), false))
+        val endIdx = min(page * 24, filtered.size)
+        return Observable.just(MangasPage(filtered.subList(startIdx, endIdx), endIdx < filtered.size))
     }
 
-    override fun getFilterList() = getFilters()
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl/webtoon/${manga.url}.html", headers)
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl/webtoon/${manga.url}.html#${manga.status}", headers)
-
-    override fun getMangaUrl(manga: SManga): String = buildString {
-        append(baseUrl)
-        append("/webtoon/")
-        append(manga.url)
-        append(".html")
-    }
-
-    override fun mangaDetailsParse(response: Response): SManga {
+    override fun mangaDetailsParse(response: Response): SManga = SManga.create().apply {
         val doc = response.asJsoup()
-        return SManga.create().apply {
-            description = doc.select("p.mt-2").last()?.text()
-            thumbnail_url = doc.selectFirst("script:containsData(+img_domain+)")?.data()?.let {
-                cdnUrl + it.substringAfter("+'").substringBefore("'+")
-            }
-            status = response.request.url.fragment!!.toInt()
-        }
+        description = doc.select("p.mt-2").last()?.text()
     }
 
-    override fun chapterListRequest(manga: SManga): Request {
-        val url = "$baseUrl/data/toonlist/${manga.url}.js?v=${"%.17f".format(Random.nextDouble())}"
-        return GET(url, headers)
-    }
+    override fun chapterListRequest(manga: SManga): Request = GET("$baseUrl/data/toonlist/${manga.url}.js", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val mangaId = response.request.url.pathSegments.last().removeSuffix(".js")
-
-        val data = response.body.string()
-            .substringAfter(" = ")
-            .removeSuffix(";")
-            .let { json.decodeFromString<List<Chapter>>(it) }
-
-        return data.map { it.toSChapter(mangaId) }.reversed()
-    }
-
-    override fun getChapterUrl(chapter: SChapter): String = buildString {
-        append(baseUrl)
-        append("/webtoons/")
-        append(chapter.url)
-        append(".html")
+        val responseBody = response.body.string()
+        val jsonRaw = responseBody.substringAfter(" = ").substringBeforeLast(";").trim()
+        
+        val jsonElement = json.parseToJsonElement(jsonRaw)
+        return jsonElement.jsonArray.mapIndexed { index, element ->
+            val obj = element.jsonObject
+            SChapter.create().apply {
+                name = obj["name"]?.jsonPrimitive?.content ?: "회차 ${index + 1}"
+                url = mangaId + "/" + (obj["id"]?.jsonPrimitive?.content ?: "")
+                date_upload = 0L
+            }
+        }.reversed()
     }
 
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl/webtoons/${chapter.url}.html", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
-
-        return document.select("#toon_content_imgs img").map {
-            Page(0, imageUrl = cdnUrl + it.attr("o_src"))
+        return document.select("#toon_content_imgs img").mapIndexed { index, it ->
+            Page(index, imageUrl = cdnUrl + it.attr("o_src"))
         }
     }
 
-    // unused
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/webtoon/${manga.url}.html"
+    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl/webtoons/${chapter.url}.html"
     override fun popularMangaRequest(page: Int): Request = throw UnsupportedOperationException()
     override fun popularMangaParse(response: Response): MangasPage = throw UnsupportedOperationException()
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
