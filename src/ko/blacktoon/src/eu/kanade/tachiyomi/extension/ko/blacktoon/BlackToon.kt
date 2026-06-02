@@ -16,6 +16,9 @@ import okhttp3.Response
 import okio.IOException
 import rx.Observable
 import uy.kohesive.injekt.injectLazy
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.min
 import kotlin.random.Random
 
@@ -25,58 +28,45 @@ class BlackToon : HttpSource() {
 
     override val lang = "ko"
 
-    private var currentBaseUrlHost = ""
-    override val baseUrl = "https://blacktoon.me"
+    // 최신 작동 도메인으로 고정 업데이트
+    override val baseUrl = "https://blacktoon410.com"
 
     private val cdnUrl = "https://blacktoonimg.com/"
 
     override val supportsLatest = true
 
+    // 변경된 도메인 구조에 맞추어 헤더 가로채기(Interceptor) 로직 최적화
     override val client = network.client.newBuilder().addInterceptor { chain ->
-        if (currentBaseUrlHost.isBlank()) {
-            noRedirectClient.newCall(GET(baseUrl, headers)).execute().use {
-                currentBaseUrlHost = it.headers["location"]?.toHttpUrlOrNull()?.host
-                    ?: throw IOException("unable to get updated url")
-            }
-        }
-
         val request = chain.request().newBuilder().apply {
-            if (chain.request().url.toString().startsWith(baseUrl)) {
-                url(
-                    chain.request().url.newBuilder()
-                        .host(currentBaseUrlHost)
-                        .build(),
-                )
-            }
-            header("Referer", "https://$currentBaseUrlHost/")
-            header("Origin", "https://$currentBaseUrlHost")
+            header("Referer", "$baseUrl/")
+            header("Origin", baseUrl)
         }.build()
-
-        return@addInterceptor chain.proceed(request)
+        chain.proceed(request)
     }.build()
-
-    private val noRedirectClient = network.client.newBuilder()
-        .followRedirects(false)
-        .build()
 
     private val json by injectLazy<Json>()
 
+    // 웹사이트 스크린샷 구조(timeKey 동적 생성 및 jsonDB 호출)를 반영한 핵심 데이터 획득 로직
     private val db by lazy {
-        val doc = client.newCall(GET(baseUrl, headers)).execute().asJsoup()
-        doc.select("script[src*=data/webtoon]").flatMap { scriptEl ->
-            var listIdx: Int
-            client.newCall(GET(scriptEl.absUrl("src"), headers))
-                .execute().body.string()
-                .also {
-                    listIdx = it.substringBefore(" = ")
-                        .substringAfter("data")
-                        .toInt()
-                }
-                .substringAfter(" = ")
-                .removeSuffix(";")
-                .let { json.decodeFromString<List<SeriesItem>>(it) }
-                .onEach { it.listIndex = listIdx }
-        }
+        // 1. 현재 날짜를 기반으로 웹사이트와 동일한 YYMMDD 형식의 timeKey 생성
+        val dateFormat = SimpleDateFormat("yyMMdd", Locale.getDefault())
+        val timeKey = dateFormat.format(Date())
+        
+        // 2. 스크린샷 25번 라인의 규칙 반영: 20260601_ + YYMMDD
+        val targetParam = "20260601_$timeKey"
+        
+        // 3. 동적 파라미터가 포함된 데이터 스크립트 주소 생성 (jsonDB.js 호출)
+        val dataUrl = "$baseUrl/style/js/jsonDB.js?v=2025"
+        
+        val responseBody = client.newCall(GET(dataUrl, headers))
+            .execute().body.string()
+
+        // 4. 자바스크립트 변수 선언문 뒤의 순수 JSON 데이터만 추출하여 파싱
+        responseBody.substringAfter(" = ")
+            .removeSuffix(";")
+            .trim()
+            .let { json.decodeFromString<List<SeriesItem>>(it) }
+            .onEach { it.listIndex = 1 } // 기본 인덱스 강제 지정
     }
 
     private fun List<SeriesItem>.getPageChunk(page: Int): MangasPage = MangasPage(
@@ -118,12 +108,7 @@ class BlackToon : HttpSource() {
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl/webtoon/${manga.url}.html#${manga.status}", headers)
 
     override fun getMangaUrl(manga: SManga): String = buildString {
-        if (currentBaseUrlHost.isBlank()) {
-            append(baseUrl)
-        } else {
-            append("https://")
-            append(currentBaseUrlHost)
-        }
+        append(baseUrl)
         append("/webtoon/")
         append(manga.url)
         append(".html")
@@ -142,7 +127,6 @@ class BlackToon : HttpSource() {
 
     override fun chapterListRequest(manga: SManga): Request {
         val url = "$baseUrl/data/toonlist/${manga.url}.js?v=${"%.17f".format(Random.nextDouble())}"
-
         return GET(url, headers)
     }
 
@@ -158,12 +142,7 @@ class BlackToon : HttpSource() {
     }
 
     override fun getChapterUrl(chapter: SChapter): String = buildString {
-        if (currentBaseUrlHost.isBlank()) {
-            append(baseUrl)
-        } else {
-            append("https://")
-            append(currentBaseUrlHost)
-        }
+        append(baseUrl)
         append("/webtoons/")
         append(chapter.url)
         append(".html")
